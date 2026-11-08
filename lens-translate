@@ -5,7 +5,7 @@
 set -euo pipefail
 
 PRIMARY_LANG="${PRIMARY_LANG:-en}"
-SECONDARY_LANG="${SECONDARY_LANG:-pt}"
+SECONDARY_LANG="${SECONDARY_LANG:-pt-BR}"
 EXPLICIT_TARGET=""
 OCR_LANG="Latin+jpn"
 OCR_ONLY=0
@@ -22,7 +22,7 @@ normalize_ocr_lang() {
         local mapped="$item"
         case "${item,,}" in
             es|spanish)            mapped="spa" ;;
-            pt|portuguese)         mapped="por" ;;
+            pt|pt-br|portuguese)   mapped="por" ;;
             en|english)            mapped="eng" ;;
             fr|french)             mapped="fra" ;;
             de|german)             mapped="deu" ;;
@@ -164,8 +164,31 @@ def run_ocr(psm, lang_model):
     except Exception:
         return ""
 
+CJK_PATTERN = r"[\u3000-\u303f\u3040-\u309f\u30a0-\u30ff\uff00-\uffef\u4e00-\u9faf\u3400-\u4dbf]"
+
+def clean_paragraph_lines(lines):
+    merged = ""
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if not merged:
+            merged = line
+        elif merged.endswith("-") and not merged.endswith(" -"):
+            merged = merged[:-1] + line
+        else:
+            merged = merged + " " + line
+
+    # Strip artificial Tesseract spaces between Japanese/CJK characters
+    prev = None
+    while prev != merged:
+        prev = merged
+        merged = re.sub(f"({CJK_PATTERN})\\s+({CJK_PATTERN})", r"\1\2", merged)
+
+    return merged.strip()
+
 def parse_tsv(tsv_data, min_conf=40):
-    lines_dict = {}
+    paragraphs = {}
     valid_words = 0
     for row in tsv_data.splitlines():
         parts = row.split("\t")
@@ -176,8 +199,9 @@ def parse_tsv(tsv_data, min_conf=40):
                 try:
                     c = float(conf_str)
                     if c >= min_conf:
-                        block_id = (int(parts[2]), int(parts[3]), int(parts[4]))
-                        lines_dict.setdefault(block_id, []).append(text)
+                        par_key = (int(parts[2]), int(parts[3]))
+                        line_key = int(parts[4])
+                        paragraphs.setdefault(par_key, {}).setdefault(line_key, []).append(text)
                         valid_words += 1
                 except ValueError:
                     pass
@@ -185,8 +209,15 @@ def parse_tsv(tsv_data, min_conf=40):
     if valid_words == 0:
         return ""
 
-    lines = [" ".join(lines_dict[k]) for k in sorted(lines_dict.keys())]
-    combined = "\n".join(lines).strip()
+    out_paragraphs = []
+    for par_key in sorted(paragraphs.keys()):
+        lines_dict = paragraphs[par_key]
+        raw_lines = [" ".join(lines_dict[lk]) for lk in sorted(lines_dict.keys())]
+        cleaned_par = clean_paragraph_lines(raw_lines)
+        if cleaned_par:
+            out_paragraphs.append(cleaned_par)
+
+    combined = "\n\n".join(out_paragraphs).strip()
 
     # Must contain at least one meaningful letter, number, or CJK glyph
     if not re.search(r"[\w\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]", combined):
