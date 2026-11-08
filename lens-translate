@@ -60,6 +60,8 @@ Options:
   -2, --secondary LANG   Secondary language when source text is English (default: pt-BR)
   -o, --ocr-only         Only extract text, do not translate
   -s, --silent           Do not send desktop notification
+  --set-gemini-key       Store your Gemini API key securely in OS keyring (secret-tool)
+  --set-deepl-key        Store your DeepL API key securely in OS keyring (secret-tool)
   -h, --help             Show this help message
 
 Keyring / Environment Support:
@@ -71,6 +73,7 @@ Examples:
   $(basename "$0") -t pt-BR        # Force target language to Brazilian Portuguese
   $(basename "$0") -l vert         # Extract vertical Japanese text (e.g. Manga)
   $(basename "$0") -o              # Extract raw text only
+  $(basename "$0") --set-gemini-key # Save Gemini API key into OS keyring
 EOF
 }
 
@@ -96,6 +99,20 @@ while [[ $# -gt 0 ]]; do
         -s|--silent)
             SILENT=1
             shift
+            ;;
+        --set-gemini-key)
+            read -rsp "Paste your Gemini API key (input hidden): " input_key
+            echo ""
+            printf "%s" "$input_key" | secret-tool store --label="Linux Lens Gemini API Key" application linux-lens key gemini_api_key
+            echo "✅ Gemini API key saved securely to OS keyring."
+            exit 0
+            ;;
+        --set-deepl-key)
+            read -rsp "Paste your DeepL API key (input hidden): " input_key
+            echo ""
+            printf "%s" "$input_key" | secret-tool store --label="Linux Lens DeepL API Key" application linux-lens key deepl_api_key
+            echo "✅ DeepL API key saved securely to OS keyring."
+            exit 0
             ;;
         -h|--help)
             show_help
@@ -263,6 +280,18 @@ if [ "$OCR_ONLY" -eq 1 ]; then
 fi
 
 # 4. Multi-tier Translation Engine
+# Retrieve API keys from OS keyring (secret-tool) if not already set in environment
+if command -v secret-tool &>/dev/null; then
+    if [ -z "${GEMINI_API_KEY:-}" ]; then
+        GEMINI_API_KEY="$(secret-tool lookup application linux-lens key gemini_api_key 2>/dev/null || true)"
+        export GEMINI_API_KEY
+    fi
+    if [ -z "${DEEPL_API_KEY:-}" ]; then
+        DEEPL_API_KEY="$(secret-tool lookup application linux-lens key deepl_api_key 2>/dev/null || true)"
+        export DEEPL_API_KEY
+    fi
+fi
+
 TRANSLATION_OUTPUT=$(python3 - "$EXPLICIT_TARGET" "$PRIMARY_LANG" "$SECONDARY_LANG" "$EXTRACTED_TEXT" << 'PYEOF'
 import os, sys, urllib.request, urllib.parse, json
 
