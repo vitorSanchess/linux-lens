@@ -461,13 +461,14 @@ fi
 DETECTED_LANG=$(echo "$TRANSLATION_OUTPUT" | jq -r '.detected // "auto"')
 FINAL_TARGET=$(echo "$TRANSLATION_OUTPUT" | jq -r '.target // "en"')
 TRANSLATED_TEXT=$(echo "$TRANSLATION_OUTPUT" | jq -r '.translated // ""')
+ENGINE_USED=$(echo "$TRANSLATION_OUTPUT" | jq -r '.engine // "Translator"')
 
 # 5. Copy to clipboard
 echo -n "$TRANSLATED_TEXT" | wl-copy
 
 # 6. Send desktop notification
 if [ "$SILENT" -eq 0 ]; then
-    HEADER="Linux Lens (${DETECTED_LANG} -> ${FINAL_TARGET})"
+    HEADER="Linux Lens • ${ENGINE_USED} (${DETECTED_LANG} -> ${FINAL_TARGET})"
     notify-send -i accessories-dictionary "$HEADER" "$TRANSLATED_TEXT"
 fi
 
@@ -476,6 +477,6 @@ echo "----------------------------------------"
 echo "Original [${DETECTED_LANG}]:"
 echo "$EXTRACTED_TEXT"
 echo "----------------------------------------"
-echo "Translation [${FINAL_TARGET}] (copied to clipboard):"
+echo "Translation [${FINAL_TARGET}] via ${ENGINE_USED} (copied to clipboard):"
 echo "$TRANSLATED_TEXT"
 echo "----------------------------------------"
