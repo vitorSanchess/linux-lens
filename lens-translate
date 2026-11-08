@@ -1,0 +1,334 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Linux Lens - Fast Screen-to-Translate CLI Pipeline for Wayland (Niri/Hyprland/Sway)
+# ==============================================================================
+set -euo pipefail
+
+PRIMARY_LANG="${PRIMARY_LANG:-en}"
+SECONDARY_LANG="${SECONDARY_LANG:-pt}"
+EXPLICIT_TARGET=""
+OCR_LANG="Latin+jpn"
+OCR_ONLY=0
+SILENT=0
+TMP_DIR="/dev/shm"
+TESSDATA_DIR="${HOME}/.local/share/tessdata"
+
+# Normalize user-friendly 2-letter codes to Tesseract 3-letter traineddata codes
+normalize_ocr_lang() {
+    local input="$1"
+    local result=""
+    IFS='+' read -ra ADDR <<< "$input"
+    for item in "${ADDR[@]}"; do
+        local mapped="$item"
+        case "${item,,}" in
+            es|spanish)            mapped="spa" ;;
+            pt|portuguese)         mapped="por" ;;
+            en|english)            mapped="eng" ;;
+            fr|french)             mapped="fra" ;;
+            de|german)             mapped="deu" ;;
+            it|italian)            mapped="ita" ;;
+            ja|jp|japanese)        mapped="jpn" ;;
+            ja_vert|jp_vert|vert)  mapped="jpn_vert" ;;
+            zh|cn|chinese)         mapped="chi_sim" ;;
+            ko|korean)             mapped="kor" ;;
+            latin)                 mapped="Latin" ;;
+        esac
+        if [ -z "$result" ]; then
+            result="$mapped"
+        else
+            result="${result}+${mapped}"
+        fi
+    done
+    echo "$result"
+}
+
+show_help() {
+    cat << EOF
+Usage: $(basename "$0") [OPTIONS]
+
+Capture a screen region, automatically detect & extract text, and translate it.
+Copies the translation to the clipboard and sends a desktop notification.
+
+Universal Auto-Detection (Default):
+  - English text on screen -> Automatically translates to Portuguese (pt-BR)
+  - Foreign text (Japanese, Spanish, Portuguese, etc.) -> Translates to English (en)
+
+Options:
+  -t, --target LANG      Explicit target language (e.g. pt, en, es, fr, ja)
+  -l, --ocr-lang LANGS   Specific OCR language (default: Latin+jpn)
+                         Accepts 2-letter (es, pt, en, ja, vert) or 3-letter codes.
+  -2, --secondary LANG   Secondary language when source text is English (default: pt)
+  -o, --ocr-only         Only extract text, do not translate
+  -s, --silent           Do not send desktop notification
+  -h, --help             Show this help message
+
+Examples:
+  $(basename "$0")                 # Smart auto-translate (English -> Portuguese, Japanese -> English)
+  $(basename "$0") -t pt           # Force target language to Portuguese
+  $(basename "$0") -l vert         # Extract vertical Japanese text (e.g. Manga)
+  $(basename "$0") -o              # Extract raw text only
+EOF
+}
+
+# Parse CLI arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -t|--target)
+            EXPLICIT_TARGET="$2"
+            shift 2
+            ;;
+        -l|--ocr-lang)
+            OCR_LANG="$(normalize_ocr_lang "$2")"
+            shift 2
+            ;;
+        -2|--secondary)
+            SECONDARY_LANG="$2"
+            shift 2
+            ;;
+        -o|--ocr-only)
+            OCR_ONLY=1
+            shift
+            ;;
+        -s|--silent)
+            SILENT=1
+            shift
+            ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            show_help >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Ensure required commands exist
+for cmd in grim slurp tesseract python3 wl-copy notify-send; do
+    if ! command -v "$cmd" &>/dev/null; then
+        echo "Error: Required command '$cmd' is not installed." >&2
+        notify-send -u critical "Linux Lens Error" "Required dependency '$cmd' is missing." 2>/dev/null || true
+        exit 1
+    fi
+done
+
+# Temporary files in RAM filesystem (zero disk I/O latency)
+TMP_IMG="${TMP_DIR}/lens_capture_$$.png"
+TMP_PREP="${TMP_DIR}/lens_prep_$$.png"
+cleanup() {
+    rm -f "$TMP_IMG" "$TMP_PREP"
+}
+trap cleanup EXIT INT TERM
+
+# 1. Grab screen area interactively
+REGION=$(slurp 2>/dev/null || true)
+if [ -z "$REGION" ]; then
+    # User cancelled selection (pressed Esc or clicked away)
+    exit 0
+fi
+
+# Capture uncompressed (-l 0) at 2x native scale (-s 2) for maximum font sharpness
+grim -s 2 -l 0 -g "$REGION" "$TMP_IMG"
+
+if [ ! -s "$TMP_IMG" ]; then
+    echo "Error: Screenshot failed or is empty." >&2
+    exit 1
+fi
+
+# 2. Image Preprocessing:
+# Add seamless border matching the background color so tight crops don't cut off glyph edges
+IMAGE_TO_OCR="$TMP_IMG"
+if command -v magick &>/dev/null; then
+    BG_COLOR=$(magick "$TMP_IMG"[1x1+0+0] -format "%[pixel:p{0,0}]" info: 2>/dev/null || echo "white")
+    magick "$TMP_IMG" -bordercolor "$BG_COLOR" -border 10 "$TMP_PREP" 2>/dev/null && IMAGE_TO_OCR="$TMP_PREP"
+fi
+
+# 3. Extract text with confidence validation & hallucination prevention
+# Uses Tesseract TSV mode to discard low-confidence noise (< 40%) and reject blank backgrounds
+EXTRACTED_TEXT=$(python3 - "$IMAGE_TO_OCR" "$OCR_LANG" "$TESSDATA_DIR" << 'PYEOF'
+import sys, subprocess, re
+
+image_path = sys.argv[1]
+model = sys.argv[2]
+tessdata_dir = sys.argv[3]
+
+def run_ocr(psm, lang_model):
+    cmd = ["tesseract"]
+    if tessdata_dir:
+        cmd += ["--tessdata-dir", tessdata_dir]
+    cmd += [image_path, "stdout", "-l", lang_model, "--psm", str(psm), "tsv"]
+    try:
+        return subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode("utf-8")
+    except Exception:
+        return ""
+
+def parse_tsv(tsv_data, min_conf=40):
+    lines_dict = {}
+    valid_words = 0
+    for row in tsv_data.splitlines():
+        parts = row.split("\t")
+        if len(parts) >= 12:
+            conf_str = parts[10]
+            text = parts[11].strip()
+            if conf_str not in ("-1", "conf") and text:
+                try:
+                    c = float(conf_str)
+                    if c >= min_conf:
+                        block_id = (int(parts[2]), int(parts[3]), int(parts[4]))
+                        lines_dict.setdefault(block_id, []).append(text)
+                        valid_words += 1
+                except ValueError:
+                    pass
+
+    if valid_words == 0:
+        return ""
+
+    lines = [" ".join(lines_dict[k]) for k in sorted(lines_dict.keys())]
+    combined = "\n".join(lines).strip()
+
+    # Must contain at least one meaningful letter, number, or CJK glyph
+    if not re.search(r"[\w\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]", combined):
+        return ""
+
+    return combined
+
+# First pass: standard layout
+text = parse_tsv(run_ocr(6, model))
+
+# Fallback pass: automatic page segmentation
+if not text:
+    text = parse_tsv(run_ocr(3, model))
+
+# Vertical fallback if Japanese is requested and horizontal gave nothing
+if not text and "jpn" in model:
+    text = parse_tsv(run_ocr(5, "jpn_vert"))
+
+print(text, end="")
+PYEOF
+)
+
+if [ -z "$EXTRACTED_TEXT" ]; then
+    if [ "$SILENT" -eq 0 ]; then
+        notify-send -i edit-find "Linux Lens" "No text recognized in selected area."
+    fi
+    echo "No text recognized in selected area."
+    exit 0
+fi
+
+# Handle OCR-only mode
+if [ "$OCR_ONLY" -eq 1 ]; then
+    echo -n "$EXTRACTED_TEXT" | wl-copy
+    if [ "$SILENT" -eq 0 ]; then
+        notify-send -i edit-copy "Linux Lens (OCR)" "$EXTRACTED_TEXT"
+    fi
+    echo "=== Extracted Text (copied to clipboard) ==="
+    echo "$EXTRACTED_TEXT"
+    exit 0
+fi
+
+# 4. Translation stage with high-reliability endpoints and smart auto-pairing
+TRANSLATION_OUTPUT=$(python3 - "$EXPLICIT_TARGET" "$PRIMARY_LANG" "$SECONDARY_LANG" "$EXTRACTED_TEXT" << 'PYEOF'
+import sys, urllib.request, urllib.parse, json
+
+explicit_target = sys.argv[1].strip()
+primary_lang = sys.argv[2].strip() or "en"
+secondary_lang = sys.argv[3].strip() or "pt"
+text = sys.argv[4].strip()
+
+if not text:
+    print(json.dumps({"status": "empty"}))
+    sys.exit(0)
+
+def call_translate(target_lang):
+    # 1. Native Chrome dict endpoint (unthrottled, reliable)
+    try:
+        url = f"https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=auto&tl={target_lang}&q={urllib.parse.quote(text)}"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+                "Accept": "*/*"
+            }
+        )
+        with urllib.request.urlopen(req, timeout=4) as res:
+            data = json.loads(res.read().decode("utf-8"))
+            if isinstance(data, list) and len(data) > 0:
+                if isinstance(data[0], list):
+                    tr = "".join([s[0] for s in data if isinstance(s, list) and s])
+                    dt = data[0][1] if len(data[0]) > 1 else "auto"
+                    return dt, tr
+                elif isinstance(data[0], str):
+                    return "auto", data[0]
+    except Exception:
+        pass
+
+    # 2. MyMemory fallback
+    try:
+        url = f"https://api.mymemory.translated.net/get?q={urllib.parse.quote(text)}&langpair=autodetect|{target_lang}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=4) as res:
+            data = json.loads(res.read().decode("utf-8"))
+            if data.get("responseStatus") == 200:
+                return data.get("responseData", {}).get("detectedLanguage", "auto"), data.get("responseData", {}).get("translatedText", "")
+    except Exception:
+        pass
+
+    return "auto", ""
+
+if explicit_target:
+    det, trans = call_translate(explicit_target)
+    target = explicit_target
+else:
+    # Auto mode:
+    # Query with primary language (en) first
+    det, trans = call_translate(primary_lang)
+    target = primary_lang
+
+    # If the text is detected as English (or primary language),
+    # automatically translate to Portuguese (secondary language)!
+    if det.lower().startswith(primary_lang.lower()):
+        target = secondary_lang
+        det, trans = call_translate(secondary_lang)
+
+if trans:
+    print(json.dumps({"status": "ok", "detected": det, "target": target, "translated": trans}))
+else:
+    print(json.dumps({"status": "error"}))
+PYEOF
+)
+
+STATUS=$(echo "$TRANSLATION_OUTPUT" | jq -r '.status // "error"')
+
+if [ "$STATUS" != "ok" ]; then
+    echo "Translation failed (network error or translation service unavailable)." >&2
+    if [ "$SILENT" -eq 0 ]; then
+        notify-send -u critical "Linux Lens" "Failed to translate extracted text."
+    fi
+    # Copy OCR text as fallback so user doesn't lose the selection
+    echo -n "$EXTRACTED_TEXT" | wl-copy
+    exit 1
+fi
+
+DETECTED_LANG=$(echo "$TRANSLATION_OUTPUT" | jq -r '.detected // "auto"')
+FINAL_TARGET=$(echo "$TRANSLATION_OUTPUT" | jq -r '.target // "en"')
+TRANSLATED_TEXT=$(echo "$TRANSLATION_OUTPUT" | jq -r '.translated // ""')
+
+# 5. Copy to clipboard
+echo -n "$TRANSLATED_TEXT" | wl-copy
+
+# 6. Send desktop notification
+if [ "$SILENT" -eq 0 ]; then
+    HEADER="Linux Lens (${DETECTED_LANG} -> ${FINAL_TARGET})"
+    notify-send -i accessories-dictionary "$HEADER" "$TRANSLATED_TEXT"
+fi
+
+# 7. Output to terminal
+echo "----------------------------------------"
+echo "Original [${DETECTED_LANG}]:"
+echo "$EXTRACTED_TEXT"
+echo "----------------------------------------"
+echo "Translation [${FINAL_TARGET}] (copied to clipboard):"
+echo "$TRANSLATED_TEXT"
+echo "----------------------------------------"

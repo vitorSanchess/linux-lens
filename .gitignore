@@ -1,0 +1,16 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Temp files & captures
+*.png
+*.jpg
+*.jpeg
+/dev/shm/
+
+# Editor / OS files
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
