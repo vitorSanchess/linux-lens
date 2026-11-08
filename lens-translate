@@ -50,21 +50,25 @@ Capture a screen region, automatically detect & extract text, and translate it.
 Copies the translation to the clipboard and sends a desktop notification.
 
 Universal Auto-Detection (Default):
-  - English text on screen -> Automatically translates to Portuguese (pt-BR)
+  - English text on screen -> Automatically translates to Brazilian Portuguese (pt-BR)
   - Foreign text (Japanese, Spanish, Portuguese, etc.) -> Translates to English (en)
 
 Options:
-  -t, --target LANG      Explicit target language (e.g. pt, en, es, fr, ja)
+  -t, --target LANG      Explicit target language (e.g. pt-BR, en, es, fr, ja)
   -l, --ocr-lang LANGS   Specific OCR language (default: Latin+jpn)
                          Accepts 2-letter (es, pt, en, ja, vert) or 3-letter codes.
-  -2, --secondary LANG   Secondary language when source text is English (default: pt)
+  -2, --secondary LANG   Secondary language when source text is English (default: pt-BR)
   -o, --ocr-only         Only extract text, do not translate
   -s, --silent           Do not send desktop notification
   -h, --help             Show this help message
 
+Keyring / Environment Support:
+  Automatically retrieves keys stored in your OS keyring via 'secret-tool',
+  or via GEMINI_API_KEY / DEEPL_API_KEY environment variables.
+
 Examples:
-  $(basename "$0")                 # Smart auto-translate (English -> Portuguese, Japanese -> English)
-  $(basename "$0") -t pt           # Force target language to Portuguese
+  $(basename "$0")                 # Smart auto-translate (English -> PT-BR, Japanese -> EN)
+  $(basename "$0") -t pt-BR        # Force target language to Brazilian Portuguese
   $(basename "$0") -l vert         # Extract vertical Japanese text (e.g. Manga)
   $(basename "$0") -o              # Extract raw text only
 EOF
@@ -145,14 +149,15 @@ if command -v magick &>/dev/null; then
     magick "$TMP_IMG" -bordercolor "$BG_COLOR" -border 10 "$TMP_PREP" 2>/dev/null && IMAGE_TO_OCR="$TMP_PREP"
 fi
 
-# 3. Extract text with confidence validation & hallucination prevention
-# Uses Tesseract TSV mode to discard low-confidence noise (< 40%) and reject blank backgrounds
+# 3. Extract text with confidence validation, paragraph unwrapping, and CJK space cleanup
 EXTRACTED_TEXT=$(python3 - "$IMAGE_TO_OCR" "$OCR_LANG" "$TESSDATA_DIR" << 'PYEOF'
 import sys, subprocess, re
 
 image_path = sys.argv[1]
 model = sys.argv[2]
 tessdata_dir = sys.argv[3]
+
+CJK_PATTERN = r"[\u3000-\u303f\u3040-\u309f\u30a0-\u30ff\uff00-\uffef\u4e00-\u9faf\u3400-\u4dbf]"
 
 def run_ocr(psm, lang_model):
     cmd = ["tesseract"]
@@ -163,8 +168,6 @@ def run_ocr(psm, lang_model):
         return subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode("utf-8")
     except Exception:
         return ""
-
-CJK_PATTERN = r"[\u3000-\u303f\u3040-\u309f\u30a0-\u30ff\uff00-\uffef\u4e00-\u9faf\u3400-\u4dbf]"
 
 def clean_paragraph_lines(lines):
     merged = ""
@@ -259,72 +262,185 @@ if [ "$OCR_ONLY" -eq 1 ]; then
     exit 0
 fi
 
-# 4. Translation stage with high-reliability endpoints and smart auto-pairing
+# 4. Multi-tier Translation Engine
 TRANSLATION_OUTPUT=$(python3 - "$EXPLICIT_TARGET" "$PRIMARY_LANG" "$SECONDARY_LANG" "$EXTRACTED_TEXT" << 'PYEOF'
-import sys, urllib.request, urllib.parse, json
+import os, sys, urllib.request, urllib.parse, json
 
 explicit_target = sys.argv[1].strip()
 primary_lang = sys.argv[2].strip() or "en"
-secondary_lang = sys.argv[3].strip() or "pt"
+secondary_lang = sys.argv[3].strip() or "pt-BR"
 text = sys.argv[4].strip()
 
 if not text:
     print(json.dumps({"status": "empty"}))
     sys.exit(0)
 
-def call_translate(target_lang):
-    # 1. Native Chrome dict endpoint (unthrottled, reliable)
-    try:
-        url = f"https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=auto&tl={target_lang}&q={urllib.parse.quote(text)}"
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-                "Accept": "*/*"
-            }
+def normalize_target(t):
+    if t.lower() == "pt":
+        return "pt-BR"
+    return t
+
+def call_google_android_nmt(q, target_lang):
+    """Tier 1 Keyless: Google Translate Official Android NMT POST API (full sentence neural model)"""
+    url = "https://translate.google.com/translate_a/single?client=at&dt=t&dj=1"
+    data = urllib.parse.urlencode({"sl": "auto", "tl": target_lang, "q": q}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "User-Agent": "GoogleTranslate/6.29.0.05.421283610 (Linux; U; Android 12; Pixel 6)",
+            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"
+        }
+    )
+    with urllib.request.urlopen(req, timeout=5) as res:
+        payload = json.loads(res.read().decode("utf-8"))
+        sentences = payload.get("sentences", [])
+        translated = "".join([s.get("trans", "") for s in sentences if "trans" in s]).strip()
+        detected = payload.get("src", "auto")
+        return detected, translated, "Google NMT"
+
+def call_chrome_dict(q, target_lang):
+    """Tier 2 Keyless: Chromium Built-in Translation Endpoint"""
+    url = f"https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=auto&tl={target_lang}&q={urllib.parse.quote(q)}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            "Accept": "*/*"
+        }
+    )
+    with urllib.request.urlopen(req, timeout=4) as res:
+        data = json.loads(res.read().decode("utf-8"))
+        if isinstance(data, list) and len(data) > 0:
+            if isinstance(data[0], list):
+                tr = "".join([s[0] for s in data if isinstance(s, list) and s])
+                dt = data[0][1] if len(data[0]) > 1 else "auto"
+                return dt, tr.strip(), "Google Chrome"
+            elif isinstance(data[0], str):
+                return "auto", data[0].strip(), "Google Chrome"
+    return "auto", "", ""
+
+def call_mymemory(q, target_lang):
+    """Tier 3 Keyless: MyMemory Neural MT Fallback"""
+    url = f"https://api.mymemory.translated.net/get?q={urllib.parse.quote(q)}&langpair=autodetect|{target_lang}"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=4) as res:
+        data = json.loads(res.read().decode("utf-8"))
+        if data.get("responseStatus") == 200:
+            return data.get("responseData", {}).get("detectedLanguage", "auto"), data.get("responseData", {}).get("translatedText", "").strip(), "MyMemory"
+    return "auto", "", ""
+
+def call_deepl(q, target_lang, api_key):
+    """Optional Tier 0: DeepL API (if DEEPL_API_KEY is set)"""
+    host = "https://api-free.deepl.com" if api_key.endswith(":fx") else "https://api.deepl.com"
+    tl = target_lang.upper()
+    if tl == "EN":
+        tl = "EN-US"
+    elif tl == "PT":
+        tl = "PT-BR"
+    body = json.dumps({"text": [q], "target_lang": tl}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{host}/v2/translate",
+        data=body,
+        headers={
+            "Authorization": f"DeepL-Auth-Key {api_key}",
+            "Content-Type": "application/json"
+        }
+    )
+    with urllib.request.urlopen(req, timeout=5) as res:
+        data = json.loads(res.read().decode("utf-8"))
+        tr = data["translations"][0]
+        return tr.get("detected_source_language", "auto").lower(), tr.get("text", "").strip(), "DeepL"
+
+def call_gemini(q, explicit_tl, primary_tl, secondary_tl, api_key):
+    """Optional Tier 0: Gemini Flash API (if GEMINI_API_KEY is set)"""
+    if explicit_tl:
+        rule = f"Translate the text naturally and accurately into {explicit_tl}. Set 'target' to '{explicit_tl}'."
+    else:
+        rule = (
+            f"Detect the language of the text. "
+            f"If the source text is in {primary_tl} (English), translate it naturally into {secondary_tl} (Brazilian Portuguese) and set 'target' to '{secondary_tl}'. "
+            f"Otherwise, translate it naturally into {primary_tl} (English) and set 'target' to '{primary_tl}'."
         )
-        with urllib.request.urlopen(req, timeout=4) as res:
-            data = json.loads(res.read().decode("utf-8"))
-            if isinstance(data, list) and len(data) > 0:
-                if isinstance(data[0], list):
-                    tr = "".join([s[0] for s in data if isinstance(s, list) and s])
-                    dt = data[0][1] if len(data[0]) > 1 else "auto"
-                    return dt, tr
-                elif isinstance(data[0], str):
-                    return "auto", data[0]
-    except Exception:
-        pass
+    prompt = (
+        f"{rule} Fix any minor OCR character typos from context if obvious. "
+        f"Return ONLY a JSON object with keys 'detected' (ISO language code of source, e.g. en, ja, es, pt), 'target', and 'translated'.\n\nText:\n{q}"
+    )
+    for model_name, thinking_cfg in (
+        ("gemini-3.6-flash", {"thinkingBudget": 0}),
+        ("gemini-3.5-flash-lite", None),
+        ("gemini-3.1-flash-lite", None),
+    ):
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+            gen_cfg = {"responseMimeType": "application/json", "temperature": 0.1}
+            if thinking_cfg:
+                gen_cfg["thinkingConfig"] = thinking_cfg
+            body = json.dumps({
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": gen_cfg
+            }).encode("utf-8")
+            req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=7) as res:
+                data = json.loads(res.read().decode("utf-8"))
+                raw = data["candidates"][0]["content"]["parts"][0]["text"]
+                parsed = json.loads(raw)
+                tr = parsed.get("translated", "").strip()
+                if tr:
+                    return parsed.get("detected", "auto"), parsed.get("target", explicit_tl or primary_tl), tr, "Gemini"
+        except Exception:
+            continue
+    return "auto", "", "", ""
 
-    # 2. MyMemory fallback
-    try:
-        url = f"https://api.mymemory.translated.net/get?q={urllib.parse.quote(text)}&langpair=autodetect|{target_lang}"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=4) as res:
-            data = json.loads(res.read().decode("utf-8"))
-            if data.get("responseStatus") == 200:
-                return data.get("responseData", {}).get("detectedLanguage", "auto"), data.get("responseData", {}).get("translatedText", "")
-    except Exception:
-        pass
+def translate_non_llm(q, target_lang):
+    target_lang = normalize_target(target_lang)
+    deepl_key = os.environ.get("DEEPL_API_KEY", "").strip()
 
-    return "auto", ""
+    if deepl_key:
+        try:
+            dt, tr, eng = call_deepl(q, target_lang, deepl_key)
+            if tr:
+                return dt, tr, eng
+        except Exception:
+            pass
 
-if explicit_target:
-    det, trans = call_translate(explicit_target)
-    target = explicit_target
-else:
-    # Auto mode:
-    # Query with primary language (en) first
-    det, trans = call_translate(primary_lang)
-    target = primary_lang
+    for fn in (call_google_android_nmt, call_chrome_dict, call_mymemory):
+        try:
+            dt, tr, eng = fn(q, target_lang)
+            if tr:
+                return dt, tr, eng
+        except Exception:
+            continue
 
-    # If the text is detected as English (or primary language),
-    # automatically translate to Portuguese (secondary language)!
-    if det.lower().startswith(primary_lang.lower()):
-        target = secondary_lang
-        det, trans = call_translate(secondary_lang)
+    return "auto", "", ""
+
+gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+det, target, trans, engine = "auto", "", "", ""
+
+if gemini_key:
+    det, target, trans, engine = call_gemini(
+        text,
+        normalize_target(explicit_target) if explicit_target else "",
+        normalize_target(primary_lang),
+        normalize_target(secondary_lang),
+        gemini_key
+    )
+
+if not trans:
+    if explicit_target:
+        target = normalize_target(explicit_target)
+        det, trans, engine = translate_non_llm(text, target)
+    else:
+        target = normalize_target(primary_lang)
+        det, trans, engine = translate_non_llm(text, target)
+
+        # If the text is detected as English (primary), automatically translate to Brazilian Portuguese (secondary)
+        if det.lower().startswith(primary_lang.lower()):
+            target = normalize_target(secondary_lang)
+            det, trans, engine = translate_non_llm(text, target)
 
 if trans:
-    print(json.dumps({"status": "ok", "detected": det, "target": target, "translated": trans}))
+    print(json.dumps({"status": "ok", "detected": det, "target": target, "translated": trans, "engine": engine}))
 else:
     print(json.dumps({"status": "error"}))
 PYEOF
